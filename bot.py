@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-import numpy as np
+import pandas as pd
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
@@ -14,25 +14,20 @@ SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = CryptoHistoricalDataClient()
 
-def get_indicators(closes):
-    closes = np.array(closes, dtype=float)
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0.0)[-14:].mean()
-    losses = np.where(deltas < 0, -deltas, 0.0)[-14:].mean()
-    rsi = 100.0 - (100.0 / (1.0 + gains / (losses or 1e-9)))
+def get_indicators(closes: pd.Series):
+    delta = closes.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    rsi = (100 - (100 / (1 + rs))).iloc[-1]
 
-    def ema(arr, span):
-        alpha = 2.0 / (span + 1.0)
-        out = [float(arr)]
-        for x in arr[1:]:
-            out.append(alpha * float(x) + (1.0 - alpha) * out[-1])
-        return np.array(out, dtype=float)
+    ema12 = closes.ewm(span=12, adjust=False).mean()
+    ema26 = closes.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist_bps = ((macd - signal) / closes) * 10000.0
 
-    macd = ema(closes, 12) - ema(closes, 26)
-    signal = ema(macd, 9)
-    hist_bps = float(((macd[-1] - signal[-1]) / closes[-1]) * 10000.0)
-    prev_hist_bps = float(((macd[-2] - signal[-2]) / closes[-2]) * 10000.0)
-    return float(rsi), hist_bps, prev_hist_bps
+    return float(rsi), float(hist_bps.iloc[-1]), float(hist_bps.iloc[-2])
 
 start = datetime.now(timezone.utc) - timedelta(hours=6)
 req = CryptoBarsRequest(
@@ -42,8 +37,8 @@ req = CryptoBarsRequest(
 )
 bars = data_client.get_crypto_bars(req).df
 
-btc_closes = bars.xs("BTC/USD")["close"].tail(60).tolist()
-eth_closes = bars.xs("ETH/USD")["close"].tail(60).tolist()
+btc_closes = bars.xs("BTC/USD")["close"].tail(60)
+eth_closes = bars.xs("ETH/USD")["close"].tail(60)
 
 btc_rsi, btc_hist, btc_prev_hist = get_indicators(btc_closes)
 eth_rsi, eth_hist, _ = get_indicators(eth_closes)
