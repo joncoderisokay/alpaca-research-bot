@@ -23,16 +23,16 @@ def get_indicators(closes):
 
     def ema(arr, span):
         alpha = 2.0 / (span + 1.0)
-        out = [arr]
+        out = [float(arr)]
         for x in arr[1:]:
-            out.append(alpha * x + (1.0 - alpha) * out[-1])
-        return np.array(out)
+            out.append(alpha * float(x) + (1.0 - alpha) * out[-1])
+        return np.array(out, dtype=float)
 
     macd = ema(closes, 12) - ema(closes, 26)
     signal = ema(macd, 9)
-    hist_bps = ((macd[-1] - signal[-1]) / closes[-1]) * 10000.0
-    prev_hist_bps = ((macd[-2] - signal[-2]) / closes[-2]) * 10000.0
-    return rsi, hist_bps, prev_hist_bps
+    hist_bps = float(((macd[-1] - signal[-1]) / closes[-1]) * 10000.0)
+    prev_hist_bps = float(((macd[-2] - signal[-2]) / closes[-2]) * 10000.0)
+    return float(rsi), hist_bps, prev_hist_bps
 
 start = datetime.now(timezone.utc) - timedelta(hours=6)
 req = CryptoBarsRequest(
