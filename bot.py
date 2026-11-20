@@ -11,6 +11,12 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 API_KEY = os.environ["ALPACA_API_KEY"]
 SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 
+LEADER = "BTC/USD"
+FOLLOWERS = ["ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"]
+NOTIONAL_PER_TRADE = 500.0
+MAX_ENTRY_LAG_SECONDS = 90
+HOLD_MINUTES = 30
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = CryptoHistoricalDataClient()
 
@@ -29,42 +35,76 @@ def get_indicators(closes: pd.Series):
 
     return float(rsi), float(hist_bps.iloc[-1]), float(hist_bps.iloc[-2])
 
-start = datetime.now(timezone.utc) - timedelta(hours=6)
+now_utc = datetime.now(timezone.utc)
+start = now_utc - timedelta(hours=6)
+
+all_symbols = [LEADER] + FOLLOWERS
 req = CryptoBarsRequest(
-    symbol_or_symbols=["BTC/USD", "ETH/USD"],
+    symbol_or_symbols=all_symbols,
     timeframe=TimeFrame(5, TimeFrameUnit.Minute),
     start=start
 )
 bars = data_client.get_crypto_bars(req).df
 
-btc_closes = bars.xs("BTC/USD")["close"].tail(60)
-eth_closes = bars.xs("ETH/USD")["close"].tail(60)
+# Measure execution latency from BTC's most recent completed 5-minute candle
+btc_df = bars.xs(LEADER)
+latest_bar_open = btc_df.index[-1]
+seconds_since_open = (now_utc - latest_bar_open).total_seconds()
 
-btc_rsi, btc_hist, btc_prev_hist = get_indicators(btc_closes)
-eth_rsi, eth_hist, _ = get_indicators(eth_closes)
+def get_closed_series(sym: str) -> pd.Series:
+    df = bars.xs(sym)
+    return df["close"].iloc[:-1].tail(60) if seconds_since_open < 300 else df["close"].tail(60)
 
+closed_bar_close_time = (
+    btc_df.index[-2] + timedelta(seconds=300)
+    if seconds_since_open < 300
+    else latest_bar_open + timedelta(seconds=300)
+)
+lag_seconds = (now_utc - closed_bar_close_time).total_seconds()
+
+# 1. Manage exits for all open follower positions first (even if trigger was delayed)
 positions = {p.symbol: p for p in trading_client.get_all_positions()}
+for sym in FOLLOWERS:
+    clean_sym = sym.replace("/", "")
+    if clean_sym in positions:
+        closed_orders = trading_client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[sym], limit=1)
+        )
+        if closed_orders and closed_orders.filled_at:
+            mins_held = (now_utc - closed_orders.filled_at).total_seconds() / 60.0
+            if mins_held >= HOLD_MINUTES:
+                trading_client.close_position(clean_sym)
+                print(f"CLOSED {sym} after {mins_held:.1f}m (lag: {lag_seconds:.0f}s)")
+            else:
+                print(f"HOLDING {sym} ({mins_held:.1f}m / {HOLD_MINUTES}m)")
 
-if "ETHUSD" in positions:
-    closed = trading_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=["ETH/USD"], limit=1))
-    if closed and closed.filled_at:
-        mins_held = (datetime.now(timezone.utc) - closed.filled_at).total_seconds() / 60.0
-        if mins_held >= 30:
-            trading_client.close_position("ETHUSD")
-            print(f"CLOSED ETH/USD after {mins_held:.1f}m")
-        else:
-            print(f"HOLDING ETH/USD ({mins_held:.1f}m / 30m)")
-else:
-    btc_surging = (btc_hist > btc_prev_hist) and (btc_hist > 1.5) and (btc_rsi > 58)
-    eth_lagging = (eth_rsi < 55) and (eth_hist < btc_hist * 0.5)
+# 2. Enforce staleness guard before evaluating any new entries
+if lag_seconds > MAX_ENTRY_LAG_SECONDS:
+    print(f"STALE_SKIP | Trigger delayed by {lag_seconds:.0f}s (max {MAX_ENTRY_LAG_SECONDS}s)")
+    raise SystemExit(0)
 
-    if btc_surging and eth_lagging:
+# 3. Evaluate BTC leader momentum
+btc_rsi, btc_hist, btc_prev_hist = get_indicators(get_closed_series(LEADER))
+btc_surging = (btc_hist > btc_prev_hist) and (btc_hist > 1.5) and (btc_rsi > 58)
+
+print(f"SCAN (lag: {lag_seconds:.0f}s) | BTC RSI: {btc_rsi:.1f} ({btc_hist:.2f}bps) | Surging: {btc_surging}")
+
+# 4. Check each follower for lag divergence
+for sym in FOLLOWERS:
+    clean_sym = sym.replace("/", "")
+    if clean_sym in positions:
+        continue
+
+    f_rsi, f_hist, _ = get_indicators(get_closed_series(sym))
+    f_lagging = (f_rsi < 55) and (f_hist < btc_hist * 0.5)
+
+    if btc_surging and f_lagging:
         trading_client.submit_order(MarketOrderRequest(
-            symbol="ETH/USD",
-            notional=1000.0,
+            symbol=sym,
+            notional=NOTIONAL_PER_TRADE,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC
         ))
-        print(f"BUY ETH/USD | BTC RSI: {btc_rsi:.1f}, ETH RSI: {eth_rsi:.1f}")
+        print(f"  -> BUY {sym} ($500) | {sym} RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
     else:
-        print(f"IDLE | BTC RSI: {btc_rsi:.1f} ({btc_hist:.2f}bps) | ETH RSI: {eth_rsi:.1f} ({eth_hist:.2f}bps)")
+        print(f"  -> IDLE {sym} | RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
