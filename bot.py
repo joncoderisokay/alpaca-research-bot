@@ -14,13 +14,14 @@ SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 LEADER = "BTC/USD"
 FOLLOWERS = ["ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"]
 NOTIONAL_PER_TRADE = 500.0
-MAX_ENTRY_LAG_SECONDS = 90
+MAX_ENTRY_LAG_SECONDS = 240  # 4 mins: accommodates GitHub Actions boot time inside 5m bar window
 HOLD_MINUTES = 30
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = CryptoHistoricalDataClient()
 
-def get_indicators(closes: pd.Series):
+def get_indicators(df: pd.DataFrame):
+    closes = df["close"]
     delta = closes.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
@@ -33,7 +34,8 @@ def get_indicators(closes: pd.Series):
     signal = macd.ewm(span=9, adjust=False).mean()
     hist_bps = ((macd - signal) / closes) * 10000.0
 
-    return float(rsi), float(hist_bps.iloc[-1]), float(hist_bps.iloc[-2])
+    is_green = float(df["close"].iloc[-1]) > float(df["open"].iloc[-1])
+    return float(rsi), float(hist_bps.iloc[-1]), float(hist_bps.iloc[-2]), is_green
 
 now_utc = datetime.now(timezone.utc)
 start = now_utc - timedelta(hours=6)
@@ -46,14 +48,13 @@ req = CryptoBarsRequest(
 )
 bars = data_client.get_crypto_bars(req).df
 
-# Measure execution latency from BTC's most recent completed 5-minute candle
 btc_df = bars.xs(LEADER)
 latest_bar_open = btc_df.index[-1]
 seconds_since_open = (now_utc - latest_bar_open).total_seconds()
 
-def get_closed_series(sym: str) -> pd.Series:
+def get_closed_df(sym: str) -> pd.DataFrame:
     df = bars.xs(sym)
-    return df["close"].iloc[:-1].tail(60) if seconds_since_open < 300 else df["close"].tail(60)
+    return df.iloc[:-1].tail(60) if seconds_since_open < 300 else df.tail(60)
 
 closed_bar_close_time = (
     btc_df.index[-2] + timedelta(seconds=300)
@@ -62,7 +63,7 @@ closed_bar_close_time = (
 )
 lag_seconds = (now_utc - closed_bar_close_time).total_seconds()
 
-# 1. Manage exits for all open follower positions first (even if trigger was delayed)
+# 1. Manage exits for all open follower positions first
 positions = {p.symbol: p for p in trading_client.get_all_positions()}
 for sym in FOLLOWERS:
     clean_sym = sym.replace("/", "")
@@ -78,33 +79,39 @@ for sym in FOLLOWERS:
             else:
                 print(f"HOLDING {sym} ({mins_held:.1f}m / {HOLD_MINUTES}m)")
 
-# 2. Enforce staleness guard before evaluating any new entries
+# 2. Enforce staleness guard before new entries
 if lag_seconds > MAX_ENTRY_LAG_SECONDS:
     print(f"STALE_SKIP | Trigger delayed by {lag_seconds:.0f}s (max {MAX_ENTRY_LAG_SECONDS}s)")
     raise SystemExit(0)
 
-# 3. Evaluate BTC leader momentum
-btc_rsi, btc_hist, btc_prev_hist = get_indicators(get_closed_series(LEADER))
-btc_surging = (btc_hist > btc_prev_hist) and (btc_hist > 1.5) and (btc_rsi > 58)
+# 3. Evaluate BTC leader regimes (Mode A: Breakout Surge | Mode B: Oversold Snapback)
+btc_rsi, btc_hist, btc_prev_hist, btc_green = get_indicators(get_closed_df(LEADER))
 
-print(f"SCAN (lag: {lag_seconds:.0f}s) | BTC RSI: {btc_rsi:.1f} ({btc_hist:.2f}bps) | Surging: {btc_surging}")
+btc_surge = (btc_hist > btc_prev_hist) and (btc_hist > 1.5) and (btc_rsi > 58)
+btc_snapback = (btc_rsi < 38) and (btc_hist > btc_prev_hist) and btc_green
 
-# 4. Check each follower for lag divergence
+regime = "SURGE" if btc_surge else ("SNAPBACK" if btc_snapback else "NONE")
+print(f"SCAN (lag: {lag_seconds:.0f}s) | BTC RSI: {btc_rsi:.1f} ({btc_hist:.2f}bps) | Regime: {regime}")
+
+# 4. Evaluate followers against active BTC regime
 for sym in FOLLOWERS:
     clean_sym = sym.replace("/", "")
     if clean_sym in positions:
         continue
 
-    f_rsi, f_hist, _ = get_indicators(get_closed_series(sym))
-    f_lagging = (f_rsi < 55) and (f_hist < btc_hist * 0.5)
+    f_rsi, f_hist, _, _ = get_indicators(get_closed_df(sym))
 
-    if btc_surging and f_lagging:
+    surge_entry = btc_surge and (f_rsi < 55) and (f_hist < btc_hist * 0.5)
+    snapback_entry = btc_snapback and (f_rsi < 35) and (f_hist < btc_hist)
+
+    if surge_entry or snapback_entry:
+        mode = "SURGE" if surge_entry else "SNAPBACK"
         trading_client.submit_order(MarketOrderRequest(
             symbol=sym,
             notional=NOTIONAL_PER_TRADE,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC
         ))
-        print(f"  -> BUY {sym} ($500) | {sym} RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
+        print(f"  -> BUY {sym} [{mode}] ($500) | {sym} RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
     else:
         print(f"  -> IDLE {sym} | RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
