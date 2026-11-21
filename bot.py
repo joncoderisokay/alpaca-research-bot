@@ -21,11 +21,12 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 crypto_data_client = CryptoHistoricalDataClient()
 stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
+
 def get_indicators(df: pd.DataFrame):
     closes = df["close"]
     delta = closes.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, float("nan"))
     rsi = (100 - (100 / (1 + rs))).iloc[-1]
 
@@ -38,7 +39,17 @@ def get_indicators(df: pd.DataFrame):
     is_green = float(df["close"].iloc[-1]) > float(df["open"].iloc[-1])
     return float(rsi), float(hist_bps.iloc[-1]), float(hist_bps.iloc[-2]), is_green
 
-def run_sleeve(name: str, leader: str, followers: list[str], bars_df: pd.DataFrame, positions: dict, now_utc: datetime, force_close_all: bool = False):
+
+def run_sleeve(
+    name: str,
+    leader: str,
+    followers: list[str],
+    bars_df: pd.DataFrame,
+    positions: dict,
+    now_utc: datetime,
+    force_close_all: bool = False,
+    min_hist_bps: float = 1.5,
+):
     leader_df = bars_df.xs(leader)
     latest_bar_open = leader_df.index[-1]
     seconds_since_open = (now_utc - latest_bar_open).total_seconds()
@@ -64,7 +75,12 @@ def run_sleeve(name: str, leader: str, followers: list[str], bars_df: pd.DataFra
                 continue
 
             closed_orders = trading_client.get_orders(
-                GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[sym], limit=1)
+                GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    symbols=[sym, clean_sym],
+                    side=OrderSide.BUY,
+                    limit=1,
+                )
             )
             if closed_orders and closed_orders[0].filled_at:
                 mins_held = (now_utc - closed_orders.filled_at).total_seconds() / 60.0
@@ -84,11 +100,13 @@ def run_sleeve(name: str, leader: str, followers: list[str], bars_df: pd.DataFra
 
     # 3. Leader regime check (Surges & Oversold Snapbacks)
     l_rsi, l_hist, l_prev_hist, l_green = get_indicators(get_closed_df(leader))
-    surge = (l_hist > l_prev_hist) and (l_hist > 1.5) and (l_rsi > 58)
-    snapback = (l_rsi < 38) and (l_hist > l_prev_hist) and l_green
+    surge = (l_hist > l_prev_hist) and (l_hist > min_hist_bps) and (l_rsi > 58)
+    snapback = (l_rsi < 38) and (l_hist > l_prev_hist) and (abs(l_hist) > min_hist_bps) and l_green
     regime = "SURGE" if surge else ("SNAPBACK" if snapback else "NONE")
 
-    print(f"[{name}] SCAN (lag: {lag_seconds:.0f}s) | {leader} RSI: {l_rsi:.1f} ({l_hist:.2f}bps) | Regime: {regime}")
+    print(
+        f"[{name}] SCAN (lag: {lag_seconds:.0f}s) | {leader} RSI: {l_rsi:.1f} ({l_hist:.2f}bps, min: {min_hist_bps}bps) | Regime: {regime}"
+    )
 
     # 4. Evaluate followers
     tif = TimeInForce.GTC if "/" in leader else TimeInForce.DAY
@@ -104,36 +122,47 @@ def run_sleeve(name: str, leader: str, followers: list[str], bars_df: pd.DataFra
             continue
 
         f_rsi, f_hist, _, _ = get_indicators(f_df)
-        surge_entry = surge and (f_rsi < 55) and (f_hist < l_hist * 0.5)
+        surge_entry = surge and (f_rsi < 55) and ((l_hist - f_hist) > min_hist_bps * 0.5)
         snapback_entry = snapback and (f_rsi < 35) and (f_hist < l_hist)
 
         if surge_entry or snapback_entry:
             mode = "SURGE" if surge_entry else "SNAPBACK"
-            trading_client.submit_order(MarketOrderRequest(
-                symbol=sym,
-                notional=NOTIONAL_PER_TRADE,
-                side=OrderSide.BUY,
-                time_in_force=tif
-            ))
-            print(f"  -> [{name}] BUY {sym} [{mode}] ($500) | RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
+            trading_client.submit_order(
+                MarketOrderRequest(
+                    symbol=sym,
+                    notional=NOTIONAL_PER_TRADE,
+                    side=OrderSide.BUY,
+                    time_in_force=tif,
+                )
+            )
+            print(f"  -> [{name}] BUY {sym} [{mode}] (${NOTIONAL_PER_TRADE:.0f}) | RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
         else:
             print(f"  -> [{name}] IDLE {sym} | RSI: {f_rsi:.1f} ({f_hist:.2f}bps)")
+
 
 now_utc = datetime.now(timezone.utc)
 positions = {p.symbol: p for p in trading_client.get_all_positions()}
 
-# --- SLEEVE 1: 24/7 CRYPTO ---
+# --- SLEEVE 1: 24/7 CRYPTO (Higher bps hurdle to overcome ~50 bps round-trip market fees) ---
 crypto_symbols = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"]
 crypto_bars = crypto_data_client.get_crypto_bars(
     CryptoBarsRequest(
         symbol_or_symbols=crypto_symbols,
         timeframe=TimeFrame(5, TimeFrameUnit.Minute),
-        start=now_utc - timedelta(hours=6)
+        start=now_utc - timedelta(hours=6),
     )
 ).df
-run_sleeve("CRYPTO", "BTC/USD", ["ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"], crypto_bars, positions, now_utc)
+run_sleeve(
+    "CRYPTO",
+    "BTC/USD",
+    ["ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"],
+    crypto_bars,
+    positions,
+    now_utc,
+    min_hist_bps=30.0,
+)
 
-# --- SLEEVE 2: US EQUITIES (9:30 AM - 4:00 PM ET) ---
+# --- SLEEVE 2: US EQUITIES (9:30 AM - 4:00 PM ET, commission-free) ---
 clock = trading_client.get_clock()
 if clock.is_open:
     now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
@@ -144,9 +173,18 @@ if clock.is_open:
             symbol_or_symbols=stock_symbols,
             timeframe=TimeFrame(5, TimeFrameUnit.Minute),
             start=now_utc - timedelta(days=3),  # Covers weekends/overnight gaps to ensure 60 bars
-            feed=DataFeed.IEX
+            feed=DataFeed.IEX,
         )
     ).df
-    run_sleeve("EQUITIES", "QQQ", ["IWM", "ARKK", "NVDA", "TSLA"], stock_bars, positions, now_utc, force_close_all=near_close)
+    run_sleeve(
+        "EQUITIES",
+        "QQQ",
+        ["IWM", "ARKK", "NVDA", "TSLA"],
+        stock_bars,
+        positions,
+        now_utc,
+        force_close_all=near_close,
+        min_hist_bps=1.5,
+    )
 else:
     print("[EQUITIES] Market closed — skipping stock scan")
