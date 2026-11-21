@@ -66,7 +66,7 @@ def run_sleeve(name: str, leader: str, followers: list[str], bars_df: pd.DataFra
             closed_orders = trading_client.get_orders(
                 GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[sym], limit=1)
             )
-            if closed_orders and closed_orders.filled_at:
+            if closed_orders and closed_orders[0].filled_at:
                 mins_held = (now_utc - closed_orders.filled_at).total_seconds() / 60.0
                 if mins_held >= HOLD_MINUTES:
                     trading_client.close_position(clean_sym)
