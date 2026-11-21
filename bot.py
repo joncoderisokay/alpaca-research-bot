@@ -1,4 +1,6 @@
 import os
+import time
+import random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -9,6 +11,7 @@ from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDa
 from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
+from alpaca.common.exceptions import APIError
 
 API_KEY = os.environ["ALPACA_API_KEY"]
 SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
@@ -20,9 +23,25 @@ MAX_ENTRY_LAG_SECONDS = 360
 STOCK_NO_NEW_ENTRIES_MINUTE = 40
 STOCK_FORCE_CLOSE_MINUTE = 55
 
+time.sleep(random.uniform(1.0, 4.0))
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-crypto_data_client = CryptoHistoricalDataClient()
+crypto_data_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
 stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+
+def with_retry(fn, retries: int = 3, base_delay: float = 3.0):
+    for attempt in range(retries):
+        try:
+            return fn()
+        except APIError as e:
+            if getattr(e, "status_code", None) == 429 or "too many requests" in str(e).lower():
+                if attempt < retries - 1:
+                    wait = base_delay * (2 ** attempt) + random.uniform(0.5, 1.5)
+                    print(f"[RATE_LIMIT] 429 hit — retrying in {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+            raise
 
 
 def get_indicators(df: pd.DataFrame):
@@ -55,8 +74,10 @@ def trim_over_cap_positions(positions: dict, pending_clean_syms: set[str], is_ma
             excess_notional = round(current_val - MAX_NOTIONAL_PER_ASSET, 2)
             order_sym = f"{clean_sym[:-3]}/USD" if (is_crypto and "/" not in clean_sym and clean_sym.endswith("USD")) else clean_sym
             tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
-            trading_client.submit_order(
-                MarketOrderRequest(symbol=order_sym, notional=excess_notional, side=OrderSide.SELL, time_in_force=tif)
+            with_retry(
+                lambda: trading_client.submit_order(
+                    MarketOrderRequest(symbol=order_sym, notional=excess_notional, side=OrderSide.SELL, time_in_force=tif)
+                )
             )
             pending_clean_syms.add(clean_sym)
             print(f"[CAP_TRIM] SELL ${excess_notional:.2f} of {order_sym} (was ${current_val:.2f} > ${MAX_NOTIONAL_PER_ASSET:.2f})")
@@ -110,7 +131,7 @@ def run_sleeve(
             print(f"[{name}] PENDING_ORDER {sym} — skipping")
             continue
         if force_close_all:
-            trading_client.close_position(clean_sym)
+            with_retry(lambda s=clean_sym: trading_client.close_position(s))
             print(f"[{name}] EOD_CLOSE {sym} at 3:55 PM ET")
             continue
         if sym not in bars_df.index.get_level_values(0):
@@ -121,7 +142,7 @@ def run_sleeve(
         f_rsi, f_hist, _, _ = get_indicators(f_df)
         should_exit, reason = is_thesis_reversed(l_rsi, l_hist, l_prev_hist, f_rsi, f_hist)
         if should_exit:
-            trading_client.close_position(clean_sym)
+            with_retry(lambda s=clean_sym: trading_client.close_position(s))
             print(f"[{name}] EXIT {sym} — {reason}")
         else:
             pos_val = abs(float(positions[clean_sym].market_value))
@@ -161,8 +182,10 @@ def run_sleeve(
         snapback_entry = snapback and (f_rsi < 35) and (f_hist < l_hist)
         if surge_entry or snapback_entry:
             mode = "SURGE" if surge_entry else "SNAPBACK"
-            trading_client.submit_order(
-                MarketOrderRequest(symbol=sym, notional=NOTIONAL_PER_TRADE, side=OrderSide.BUY, time_in_force=tif)
+            with_retry(
+                lambda s=sym: trading_client.submit_order(
+                    MarketOrderRequest(symbol=s, notional=NOTIONAL_PER_TRADE, side=OrderSide.BUY, time_in_force=tif)
+                )
             )
             print(f"  -> [{name}] BUY {sym} [{mode}] (+${NOTIONAL_PER_TRADE:.0f}) | RSI:{f_rsi:.1f} ({f_hist:.2f}bps)")
         else:
@@ -173,18 +196,20 @@ def run_sleeve(
 
 now_utc = datetime.now(timezone.utc)
 now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
-clock = trading_client.get_clock()
+clock = with_retry(trading_client.get_clock)
 
-positions = {p.symbol: p for p in trading_client.get_all_positions()}
-open_orders = trading_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+positions = {p.symbol: p for p in with_retry(trading_client.get_all_positions)}
+open_orders = with_retry(lambda: trading_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)))
 pending_clean_syms = {o.symbol.replace("/", "") for o in open_orders}
 
 trim_over_cap_positions(positions, pending_clean_syms, clock.is_open)
 handled_positions = set()
 
 crypto_symbols = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"]
-crypto_bars = crypto_data_client.get_crypto_bars(
-    CryptoBarsRequest(symbol_or_symbols=crypto_symbols, timeframe=TimeFrame(5, TimeFrameUnit.Minute), start=now_utc - timedelta(hours=6))
+crypto_bars = with_retry(
+    lambda: crypto_data_client.get_crypto_bars(
+        CryptoBarsRequest(symbol_or_symbols=crypto_symbols, timeframe=TimeFrame(5, TimeFrameUnit.Minute), start=now_utc - timedelta(hours=6))
+    )
 ).df
 handled_positions |= run_sleeve(
     "CRYPTO", "BTC/USD", ["ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"], crypto_bars, positions, pending_clean_syms, now_utc, min_hist_bps=30.0
@@ -195,8 +220,10 @@ if clock.is_open:
     block_stock_entries = is_3pm_hour and (now_et.minute >= STOCK_NO_NEW_ENTRIES_MINUTE)
     force_close_stocks = is_3pm_hour and (now_et.minute >= STOCK_FORCE_CLOSE_MINUTE)
     stock_symbols = ["QQQ", "IWM", "ARKK", "NVDA", "TSLA"]
-    stock_bars = stock_data_client.get_stock_bars(
-        StockBarsRequest(symbol_or_symbols=stock_symbols, timeframe=TimeFrame(5, TimeFrameUnit.Minute), start=now_utc - timedelta(days=3), feed=DataFeed.IEX)
+    stock_bars = with_retry(
+        lambda: stock_data_client.get_stock_bars(
+            StockBarsRequest(symbol_or_symbols=stock_symbols, timeframe=TimeFrame(5, TimeFrameUnit.Minute), start=now_utc - timedelta(days=3), feed=DataFeed.IEX)
+        )
     ).df
     handled_positions |= run_sleeve(
         "EQUITIES", "QQQ", ["IWM", "ARKK", "NVDA", "TSLA"], stock_bars, positions, pending_clean_syms, now_utc, min_hist_bps=1.5, block_new_entries=block_stock_entries, force_close_all=force_close_stocks
@@ -210,5 +237,5 @@ for clean_sym, pos in positions.items():
     if pos.asset_class != AssetClass.CRYPTO and not clock.is_open:
         print(f"[ORPHAN] SKIP {clean_sym} (equity market closed)")
         continue
-    trading_client.close_position(clean_sym)
+    with_retry(lambda s=clean_sym: trading_client.close_position(s))
     print(f"[ORPHAN] CLOSED untracked position {clean_sym}")
